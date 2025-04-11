@@ -1,0 +1,142 @@
+# ============================================================
+# TIØ4317 Project – Full ARIMAX Modeling Pipeline
+# Includes: data prep, stationarity check, model, evaluation
+# ============================================================
+
+# ---- Install & Load Required Packages ----
+packages <- c("readr", "dplyr", "lubridate", "stringr", "tseries",
+              "forecast", "Metrics", "ggplot2")
+
+installed <- packages %in% rownames(installed.packages())
+if (any(!installed)) install.packages(packages[!installed])
+
+lapply(packages, library, character.only = TRUE)
+
+# ---- Load Raw Data ----
+n01 <- read_csv("/Users/larsberg/Indok/5klasse/Empirisk/GUI_ENERGY_PRICES_N01.csv", skip = 6)
+exchange <- read_csv("/Users/larsberg/Indok/5klasse/Empirisk/exchange_rate.csv")
+brent <- read_csv("/Users/larsberg/Indok/5klasse/Empirisk/brent_spot_prices_2020_2025.csv")
+weather <- read_csv("/Users/larsberg/Indok/5klasse/Empirisk/weather_data.csv")
+
+# ---- Clean Electricity Prices (N01) ----
+colnames(n01) <- c("Datetime_Range", "Price_EUR_MWh")
+
+n01 <- n01 %>%
+  filter(!is.na(Price_EUR_MWh)) %>%
+  mutate(Date = str_split(Datetime_Range, " - ", simplify = TRUE)[, 1]) %>%
+  mutate(Date = dmy_hms(Date)) %>%
+  mutate(Date = as.Date(Date)) %>%
+  group_by(Date) %>%
+  summarise(Price_EUR_MWh = mean(Price_EUR_MWh, na.rm = TRUE), .groups = "drop")
+
+# ---- Clean Exchange Rate ----
+exchange <- exchange %>%
+  mutate(Date = as.Date(Date)) %>%
+  select(Date, NOK_EUR)
+
+# ---- Clean Brent Oil Prices ----
+brent <- brent %>%
+  mutate(Date = as.Date(Date)) %>%
+  rename(Brent_Oil = CLOSE) %>%
+  select(Date, Brent_Oil)
+
+# ---- Clean Weather Data ----
+weather <- weather %>%
+  mutate(Tid_renset = str_trim(`Tid(norsk normaltid)`)) %>%
+  mutate(Date = parse_date_time(Tid_renset, orders = c("dmy HMS", "dmy HM", "dmy H", "dmy"))) %>%
+  mutate(Date = as.Date(Date)) %>%
+  mutate(`Middeltemperatur (døgn)` = str_replace(`Middeltemperatur (døgn)`, ",", ".")) %>%
+  mutate(`Middeltemperatur (døgn)` = as.numeric(`Middeltemperatur (døgn)`)) %>%
+  group_by(Date) %>%
+  summarise(Avg_Temp = mean(`Middeltemperatur (døgn)`, na.rm = TRUE), .groups = "drop")
+
+# ---- Merge All Data ----
+df <- n01 %>%
+  inner_join(exchange, by = "Date") %>%
+  inner_join(brent, by = "Date") %>%
+  inner_join(weather, by = "Date")
+
+# ---- Save Merged Dataset ----
+write_csv(df, "/Users/larsberg/Indok/5klasse/Empirisk/ARIMAX_Input_Data.csv")
+cat("Merged dataset saved as 'ARIMAX_Input_Data.csv'\n\n")
+
+# ---- Check Stationarity (ADF Test) ----
+cat(" ADF Test on Raw Prices:\n")
+print(adf.test(df$Price_EUR_MWh))
+
+cat("\n ADF Test on First-Differenced Prices:\n")
+price_diff <- diff(df$Price_EUR_MWh)
+print(adf.test(price_diff))
+
+# ---- Prepare Time Series & Exogenous Variables ----
+ts_price <- ts(df$Price_EUR_MWh, frequency = 365)
+xreg_all <- as.matrix(df[, c("Brent_Oil", "NOK_EUR", "Avg_Temp")])
+
+# ---- Train/Test Split ----
+n_total <- nrow(df)
+n_test <- 30
+n_train <- n_total - n_test
+
+train_ts <- ts(df$Price_EUR_MWh[1:n_train], frequency = 365)
+xreg_train <- xreg_all[1:n_train, ]
+xreg_test  <- xreg_all[(n_train + 1):n_total, ]
+actual_test <- df$Price_EUR_MWh[(n_train + 1):n_total]
+dates_test  <- df$Date[(n_train + 1):n_total]
+
+# ---- Fit ARIMAX Model ----
+cat("\n Fitting ARIMAX model...\n")
+fit <- auto.arima(train_ts, xreg = xreg_train)
+print(summary(fit))
+
+# ---- Forecast ----
+forecasted <- forecast(fit, xreg = xreg_test, h = n_test)
+predicted <- as.numeric(forecasted$mean)
+
+# ---- Evaluate Model ----
+mae_val <- mae(actual_test, predicted)
+rmse_val <- rmse(actual_test, predicted)
+
+cat("\n Forecast Evaluation:\n")
+cat("MAE:", round(mae_val, 2), "\n")
+cat("RMSE:", round(rmse_val, 2), "\n")
+
+# ---- Final Plot: Training + Actual + Forecast ----
+
+df_train <- data.frame(
+  Date = df$Date[1:n_train],
+  Price = df$Price_EUR_MWh[1:n_train],
+  Type = "Training Data"
+)
+
+df_actual <- data.frame(
+  Date = df$Date[(n_train + 1):n_total],
+  Price = actual_test,
+  Type = "Actual Test Data"
+)
+
+df_forecast <- data.frame(
+  Date = dates_test,
+  Price = predicted,
+  Type = "Forecast"
+)
+
+df_combined <- bind_rows(df_train, df_actual, df_forecast)
+
+plot_full <- ggplot(df_combined, aes(x = Date, y = Price, color = Type)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = c("Training Data" = "blue",
+                                "Actual Test Data" = "black",
+                                "Forecast" = "red")) +
+  labs(title = "ARIMAX Forecast vs Actual Electricity Prices",
+       x = "Date", y = "EUR/MWh") +
+  theme_minimal(base_size = 13)
+
+# Save plot
+if (!dir.exists("plots")) dir.create("plots")
+ggsave("plots/arimax_forecast_full.png", plot = plot_full, width = 10, height = 5)
+
+# Also show in RStudio Plots panel
+print(plot_full)
+
+cat(" Full forecast plot saved to 'plots/arimax_forecast_full.png'\n")
+
